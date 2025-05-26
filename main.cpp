@@ -1,5 +1,4 @@
 #include <opencv2/opencv.hpp>
-#include <raspicam/raspicam_cv.h>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -73,6 +72,7 @@ public:
     }
 };
 
+
 static std::vector<cv::Point> findLineContour(const cv::Mat& edges, const cv::Mat& frame) {
     std::vector<std::vector<cv::Point>> contours;
     cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
@@ -103,6 +103,7 @@ static std::pair<double, double> calculateDeviation(const std::vector<cv::Point>
                                                     int cx, int cy, int height) {
     if (trajectory.size() < 2)
         return {0.0, 0.0};
+    
 
     cv::Point farthest = trajectory[0];
     for (const auto& pt : trajectory) {
@@ -111,9 +112,9 @@ static std::pair<double, double> calculateDeviation(const std::vector<cv::Point>
         }
     }
     
+
     double minDist = std::numeric_limits<double>::max();
     cv::Point closestPt;
-    int closestSegment = -1;
     
     for (size_t i = 0; i < trajectory.size() - 1; ++i) {
         cv::Point A = trajectory[i];
@@ -130,7 +131,6 @@ static std::pair<double, double> calculateDeviation(const std::vector<cv::Point>
         if (dist < minDist) {
             minDist = dist;
             closestPt = proj;
-            closestSegment = i;
         }
     }
     
@@ -139,21 +139,10 @@ static std::pair<double, double> calculateDeviation(const std::vector<cv::Point>
     
 
     double dx = farthest.x - cx;
-    double dy = cy - farthest.y;
+    double dy = cy - farthest.y; 
     double angular = std::atan2(dx, dy) * 180.0 / M_PI;
     
     return {lateral, angular};
-}
-
-
-static cv::Mat getROI(const cv::Mat& frame) {
-
-
-    int height = frame.rows;
-    int width = frame.cols;
-    
-
-    return frame;
 }
 
 volatile bool running = true;
@@ -166,23 +155,48 @@ int main() {
     signal(SIGINT, sigHandler);
     
 
-    raspicam::RaspiCam_Cv camera;
+    cv::VideoCapture camera;
     
-    camera.set(cv::CAP_PROP_FORMAT, CV_8UC3);
-    camera.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    camera.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-    camera.set(cv::CAP_PROP_FPS, 30);
+
+    std::cout << "Attempting to open camera..." << std::endl;
     
-    if (!camera.open()) {
-        std::cerr << "Error opening camera" << std::endl;
+
+    camera.open(0, cv::CAP_V4L2);
+    
+    if (!camera.isOpened()) {
+        std::cout << "V4L2 failed, trying GStreamer with libcamera..." << std::endl;
+
+        camera.open("libcamerasrc ! video/x-raw,width=640,height=480,framerate=30/1 ! videoconvert ! appsink", cv::CAP_GSTREAMER);
+    }
+    
+    if (!camera.isOpened()) {
+        std::cout << "GStreamer failed, trying default backend..." << std::endl;
+
+        camera.open(0);
+    }
+    
+    if (!camera.isOpened()) {
+        std::cerr << "Error: Could not open camera with any method!" << std::endl;
+        std::cerr << "Troubleshooting:" << std::endl;
+        std::cerr << "1. Check camera connection" << std::endl;
+        std::cerr << "2. Run: sudo modprobe bcm2835-v4l2" << std::endl;
+        std::cerr << "3. Run: libcamera-hello" << std::endl;
+        std::cerr << "4. Check if /dev/video0 exists" << std::endl;
         return -1;
     }
     
+    std::cout << "Camera opened successfully!" << std::endl;
+    
 
-    double alpha = 0.15;        
-    double rdpEpsilon = 2.5;      
+    camera.set(cv::CAP_PROP_FRAME_WIDTH, 640);
+    camera.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    camera.set(cv::CAP_PROP_FPS, 30);
+    camera.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    
+
+    double alpha = 0.15;         
+    double rdpEpsilon = 2.5;    
     int sobelThreshold = 40;     
-    int lineThickness = 10;      
     
 
     LowPassFilter lateralFilter(alpha);
@@ -195,7 +209,7 @@ int main() {
 
     cv::namedWindow("Line Follower - Downward Camera", cv::WINDOW_AUTOSIZE);
     
-    std::cout << "Starting line follower (downward-facing camera). Press Ctrl+C to exit." << std::endl;
+    std::cout << "Starting line follower (downward-facing camera). Press Ctrl+C or ESC to exit." << std::endl;
     std::cout << std::fixed << std::setprecision(1);
     
     auto lastTime = std::chrono::steady_clock::now();
@@ -203,11 +217,15 @@ int main() {
     
     while (running) {
         cv::Mat frame;
-        camera.grab();
-        camera.retrieve(frame);
+        
+
+        if (!camera.read(frame)) {
+            std::cerr << "Error: Failed to capture frame" << std::endl;
+            continue;
+        }
         
         if (frame.empty()) {
-            std::cerr << "Empty frame received" << std::endl;
+            std::cerr << "Error: Empty frame received" << std::endl;
             continue;
         }
         
@@ -216,16 +234,12 @@ int main() {
         int cy = frame.rows / 2;
         
 
-        cv::Mat roi = getROI(frame);
-        
-
         cv::Mat gray;
-        cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
         
 
         cv::GaussianBlur(gray, gray, cv::Size(5, 5), 1.0);
         
-
 
         cv::Mat binary;
         cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
