@@ -1,10 +1,13 @@
 #include <opencv2/opencv.hpp>
+#include <raspicam/raspicam_cv.h>
 #include <cmath>
 #include <algorithm>
-#include <raspicam/raspicam_cv.h>
 #include <iostream>
 #include <iomanip>
 #include <csignal>
+#include <vector>
+#include <chrono>
+
 
 static std::vector<cv::Point> rdp(const std::vector<cv::Point>& pts, double eps) {
     if (pts.size() < 3)
@@ -15,6 +18,9 @@ static std::vector<cv::Point> rdp(const std::vector<cv::Point>& pts, double eps)
     double dx = B.x - A.x;
     double dy = B.y - A.y;
     double norm = std::hypot(dx, dy);
+
+    if (norm < 1e-6)
+        return {A, B};
 
     double maxDist = 0.0;
     int idx = 0;
@@ -38,47 +44,9 @@ static std::vector<cv::Point> rdp(const std::vector<cv::Point>& pts, double eps)
         return leftRes;
     }
 
-    return { A, B };
+    return {A, B};
 }
 
-static cv::Vec4i createSingleTrajectory(const std::vector<cv::Vec4i>& lines,
-                                         double maxDistance,
-                                         int imageWidth, int imageHeight) {
-    if (lines.empty()) return {0, 0, 0, 0};
-
-    std::vector<cv::Point> allPts;
-    allPts.reserve(lines.size() * 2);
-    for (const auto& ln : lines) {
-        allPts.emplace_back(ln[0], ln[1]);
-        allPts.emplace_back(ln[2], ln[3]);
-    }
-
-    cv::Vec4f fl;
-    cv::fitLine(allPts, fl, cv::DIST_L2, 0, 0.01, 0.01);
-
-    float vx = fl[0];
-    float vy = fl[1];
-    float x0 = fl[2];
-    float y0 = fl[3];
-
-    if (std::abs(vy) < 0.1f) {
-        double tL = -x0 / vx;
-        double tR = (imageWidth - x0) / vx;
-        int yL = static_cast<int>(std::round(y0 + tL * vy));
-        int yR = static_cast<int>(std::round(y0 + tR * vy));
-        return {0, yL, imageWidth, yR};
-    }
-
-    double tTop = -y0 / vy;
-    double tBot = (imageHeight - y0) / vy;
-    int xTop = static_cast<int>(std::clamp(std::round(x0 + tTop * vx), 0.0, static_cast<double>(imageWidth)));
-    int xBot = static_cast<int>(std::clamp(std::round(x0 + tBot * vx), 0.0, static_cast<double>(imageWidth)));
-
-    if (vy > 0)
-        return {xTop, 0, xBot, imageHeight};
-    else
-        return {xBot, imageHeight, xTop, 0};
-}
 
 class LowPassFilter {
 private:
@@ -105,6 +73,89 @@ public:
     }
 };
 
+static std::vector<cv::Point> findLineContour(const cv::Mat& edges, const cv::Mat& frame) {
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(edges, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    
+    if (contours.empty())
+        return {};
+    
+
+    size_t longestIdx = 0;
+    size_t maxLength = 0;
+    
+    for (size_t i = 0; i < contours.size(); ++i) {
+        if (contours[i].size() > maxLength) {
+            maxLength = contours[i].size();
+            longestIdx = i;
+        }
+    }
+    
+
+    if (maxLength < 50)
+        return {};
+    
+    return contours[longestIdx];
+}
+
+
+static std::pair<double, double> calculateDeviation(const std::vector<cv::Point>& trajectory, 
+                                                    int cx, int cy, int height) {
+    if (trajectory.size() < 2)
+        return {0.0, 0.0};
+
+    cv::Point farthest = trajectory[0];
+    for (const auto& pt : trajectory) {
+        if (pt.y < farthest.y) {
+            farthest = pt;
+        }
+    }
+    
+    double minDist = std::numeric_limits<double>::max();
+    cv::Point closestPt;
+    int closestSegment = -1;
+    
+    for (size_t i = 0; i < trajectory.size() - 1; ++i) {
+        cv::Point A = trajectory[i];
+        cv::Point B = trajectory[i + 1];
+        
+
+        double dx = B.x - A.x;
+        double dy = B.y - A.y;
+        double t = std::max(0.0, std::min(1.0, ((cx - A.x) * dx + (cy - A.y) * dy) / (dx * dx + dy * dy + 1e-6)));
+        
+        cv::Point proj(A.x + t * dx, A.y + t * dy);
+        double dist = std::hypot(cx - proj.x, cy - proj.y);
+        
+        if (dist < minDist) {
+            minDist = dist;
+            closestPt = proj;
+            closestSegment = i;
+        }
+    }
+    
+
+    double lateral = closestPt.x - cx;
+    
+
+    double dx = farthest.x - cx;
+    double dy = cy - farthest.y;
+    double angular = std::atan2(dx, dy) * 180.0 / M_PI;
+    
+    return {lateral, angular};
+}
+
+
+static cv::Mat getROI(const cv::Mat& frame) {
+
+
+    int height = frame.rows;
+    int width = frame.cols;
+    
+
+    return frame;
+}
+
 volatile bool running = true;
 
 void sigHandler(int sig) {
@@ -114,6 +165,7 @@ void sigHandler(int sig) {
 int main() {
     signal(SIGINT, sigHandler);
     
+
     raspicam::RaspiCam_Cv camera;
     
     camera.set(cv::CAP_PROP_FORMAT, CV_8UC3);
@@ -126,81 +178,188 @@ int main() {
         return -1;
     }
     
-    double alpha = 0.2;
-    int maxDist = 15;
-    
-    LowPassFilter devFilter(alpha), angFilter(alpha);
-    cv::Vec4i prevLine{0, 0, 0, 0};
-    bool locked = false;
-    
-    sleep(3);
 
-    std::cout << "Starting trajectory detection. Press Ctrl+C to exit." << std::endl;
+    double alpha = 0.15;        
+    double rdpEpsilon = 2.5;      
+    int sobelThreshold = 40;     
+    int lineThickness = 10;      
+    
+
+    LowPassFilter lateralFilter(alpha);
+    LowPassFilter angularFilter(alpha);
+    
+
+    std::cout << "Waiting for camera to stabilize..." << std::endl;
+    cv::waitKey(2000);
+    
+
+    cv::namedWindow("Line Follower - Downward Camera", cv::WINDOW_AUTOSIZE);
+    
+    std::cout << "Starting line follower (downward-facing camera). Press Ctrl+C to exit." << std::endl;
     std::cout << std::fixed << std::setprecision(1);
     
+    auto lastTime = std::chrono::steady_clock::now();
+    int frameCount = 0;
+    
     while (running) {
-        cv::Mat color;
+        cv::Mat frame;
         camera.grab();
-        camera.retrieve(color);
+        camera.retrieve(frame);
         
-        if (color.empty()) {
+        if (frame.empty()) {
             std::cerr << "Empty frame received" << std::endl;
             continue;
         }
         
-        int cx = color.cols / 2;
-        int cy = color.rows / 2;
 
-        cv::Vec4i traj{0, 0, 0, 0};
-        if (!locked) {
-            cv::Mat gray, sx, sy, edges;
-            cv::cvtColor(color, gray, cv::COLOR_BGR2GRAY);
-            cv::Sobel(gray, sx, CV_16S, 1, 0);
-            cv::Sobel(gray, sy, CV_16S, 0, 1);
-            cv::convertScaleAbs(sx, sx);
-            cv::convertScaleAbs(sy, sy);
-            cv::bitwise_or(sx, sy, edges);
-            cv::threshold(edges, edges, 50, 255, cv::THRESH_BINARY);
+        int cx = frame.cols / 2;
+        int cy = frame.rows / 2;
+        
 
-            std::vector<cv::Vec4i> lines;
-            cv::HoughLinesP(edges, lines, 1, CV_PI / 180, 50, 50, 10);
-            if (!lines.empty()) {
-                traj = createSingleTrajectory(lines, maxDist, color.cols, color.rows);
-                if (traj != cv::Vec4i(0, 0, 0, 0)) {
-                    prevLine = traj;
-                    locked = true;
+        cv::Mat roi = getROI(frame);
+        
+
+        cv::Mat gray;
+        cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+        
+
+        cv::GaussianBlur(gray, gray, cv::Size(5, 5), 1.0);
+        
+
+
+        cv::Mat binary;
+        cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+        
+
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
+        cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+        
+
+        std::vector<cv::Point> lineContour = findLineContour(binary, frame);
+        
+
+        cv::Mat display = frame.clone();
+        
+
+        cv::circle(display, cv::Point(cx, cy), 8, cv::Scalar(255, 0, 255), -1);
+        cv::circle(display, cv::Point(cx, cy), 15, cv::Scalar(255, 0, 255), 2);
+        
+
+        cv::arrowedLine(display, cv::Point(cx, cy), cv::Point(cx, cy - 50), 
+                       cv::Scalar(255, 255, 0), 2, cv::LINE_AA, 0, 0.3);
+        
+        if (!lineContour.empty()) {
+
+            std::vector<cv::Point> simplified = rdp(lineContour, rdpEpsilon);
+            
+            if (simplified.size() >= 2) {
+
+                cv::polylines(display, simplified, false, cv::Scalar(0, 255, 0), 3);
+                
+
+                for (const auto& pt : simplified) {
+                    cv::circle(display, pt, 4, cv::Scalar(0, 255, 255), -1);
                 }
+                
+
+                auto [lateral, angular] = calculateDeviation(simplified, cx, cy, frame.rows);
+                
+
+                lateral = lateralFilter.filter(lateral);
+                angular = angularFilter.filter(angular);
+                
+
+                cv::Point farthest = simplified[0];
+                for (const auto& pt : simplified) {
+                    if (pt.y < farthest.y) {
+                        farthest = pt;
+                    }
+                }
+                
+
+                cv::line(display, cv::Point(cx, cy), farthest, cv::Scalar(0, 0, 255), 2);
+                
+
+                cv::circle(display, farthest, 8, cv::Scalar(0, 0, 255), -1);
+                
+
+                int lateralPx = static_cast<int>(lateral);
+                cv::line(display, cv::Point(cx, cy - 5), cv::Point(cx + lateralPx, cy - 5), 
+                        cv::Scalar(255, 0, 0), 3);
+                
+
+                std::string lateralText = "Lateral: " + std::to_string(static_cast<int>(lateral)) + " px";
+                std::string angularText = "Angular: " + std::to_string(static_cast<int>(angular)) + " deg";
+                
+
+                cv::rectangle(display, cv::Point(5, 5), cv::Point(250, 90), 
+                             cv::Scalar(0, 0, 0), -1);
+                
+                cv::putText(display, lateralText, cv::Point(10, 30), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+                cv::putText(display, angularText, cv::Point(10, 60), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+                
+
+                std::string direction = (lateral > 5) ? "Turn LEFT" : 
+                                      (lateral < -5) ? "Turn RIGHT" : "STRAIGHT";
+                cv::putText(display, direction, cv::Point(10, 85), 
+                           cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
+                
+
+                std::cout << "\rLateral: " << std::setw(6) << lateral 
+                         << " px \t Angular: " << std::setw(6) << angular 
+                         << " deg \t " << std::setw(10) << direction << std::flush;
             }
         } else {
-            traj = prevLine;
-        }
 
-        if (traj != cv::Vec4i(0, 0, 0, 0)) {
-            cv::Point A(traj[0], traj[1]);
-            cv::Point B(traj[2], traj[3]);
-
-            cv::Point farPt = (A.y < B.y ? A : B);
-            if (A.y < cy && B.y < cy)
-                farPt = (A.y < B.y ? A : B);
-
-            double num = std::abs((B.y - A.y) * cx - (B.x - A.x) * cy + B.x * A.y - B.y * A.x);
-            double den = std::hypot(B.y - A.y, B.x - A.x);
-            double lat = devFilter.filter(num / den);
-
-            double dx = farPt.x - cx;
-            double dy = farPt.y - cy;
-            double targetAng = std::atan2(dy, dx) * 180.0 / M_PI;
-            double angErr = angFilter.filter(targetAng);
-
-            std::cout << "\rLateral: " << std::setw(6) << lat << " px \t Angular: " << std::setw(6) << angErr << " deg" << std::flush;
-        } else {
-            std::cout << "\rDetecting..." << std::flush;
+            cv::putText(display, "NO LINE DETECTED", cv::Point(10, 30), 
+                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
+            std::cout << "\rNo line detected...                              " << std::flush;
         }
         
-        usleep(33333);  // ~30fps
+
+        for (int i = 0; i < display.cols; i += 40) {
+            cv::line(display, cv::Point(i, 0), cv::Point(i, display.rows), 
+                    cv::Scalar(50, 50, 50), 1);
+        }
+        for (int i = 0; i < display.rows; i += 40) {
+            cv::line(display, cv::Point(0, i), cv::Point(display.cols, i), 
+                    cv::Scalar(50, 50, 50), 1);
+        }
+        
+
+        frameCount++;
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastTime).count();
+        if (elapsed >= 1) {
+            double fps = frameCount / static_cast<double>(elapsed);
+            cv::putText(display, "FPS: " + std::to_string(static_cast<int>(fps)), 
+                       cv::Point(540, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+            frameCount = 0;
+            lastTime = currentTime;
+        }
+        
+
+        cv::imshow("Line Follower - Downward Camera", display);
+        
+
+        cv::Mat binaryDisplay;
+        cv::cvtColor(binary, binaryDisplay, cv::COLOR_GRAY2BGR);
+        cv::resize(binaryDisplay, binaryDisplay, cv::Size(320, 240));
+        cv::imshow("Binary Detection", binaryDisplay);
+        
+
+        if (cv::waitKey(1) == 27) {
+            running = false;
+        }
     }
     
-    std::cout << std::endl << "Exiting..." << std::endl;
+    std::cout << std::endl << "Shutting down..." << std::endl;
+    
+    cv::destroyAllWindows();
     camera.release();
+    
     return 0;
 }
